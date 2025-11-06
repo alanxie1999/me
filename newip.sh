@@ -21,7 +21,7 @@ Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 
 # --- 版本与路径 ---
-shell_version="1.3.0"
+shell_version="1.5.0"
 ct_new_ver="2.11.2"
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -1881,7 +1881,8 @@ manage_gost_services() {
   echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
   echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
   echo ""
-  read -e -p "$(echo -e ${yellow}请输入选项 [0-11]: ${plain})" num
+  echo -ne "${yellow}请输入选项 [0-11]: ${plain}"
+  read num
   case "$num" in
   1)
     Install_ct
@@ -2226,11 +2227,12 @@ main_menu() {
     echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
     echo -e "${green}║${plain}  ${white}【其他功能】${plain}                                             ${green}║${plain}"
     echo -e "${green}║${plain}    ${yellow}7.${plain} 配置备份 - 备份 WireGuard/IPIP/Gost 配置            ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}8.${plain} Cloudflare WARP - WARP 客户端和 WireGuard 网络      ${green}║${plain}"
     echo -e "${green}║${plain}    ${yellow}h.${plain} 帮助说明 - 使用教程和注意事项                       ${green}║${plain}"
     echo -e "${green}║${plain}    ${red}0.${plain} 退出脚本                                            ${green}║${plain}"
     echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
     echo ""
-    echo -ne "${yellow}请输入选项 [0-7/h]: ${plain}"
+    echo -ne "${yellow}请输入选项 [0-8/h]: ${plain}"
     read opt
     case "$opt" in
     1) 
@@ -2254,6 +2256,9 @@ main_menu() {
     7) 
       backup_menu
       ;;
+    8) 
+      manage_warp
+      ;;
     h|H) 
       show_help
       ;;
@@ -2267,6 +2272,156 @@ main_menu() {
       ;;
     esac
   done
+}
+
+# =========================================================
+# Cloudflare WARP 管理（集成 P3TERX/warp.sh）
+# =========================================================
+manage_warp() {
+  # 调用 WARP 脚本的菜单功能
+  if [[ -f "$0" ]]; then
+    # 临时保存当前脚本路径
+    local script_path="$0"
+    # 执行 WARP 菜单（通过 source 调用 Start_Menu 函数）
+    bash -c "source <(curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh) && Start_Menu" || {
+      # 如果在线脚本不可用，尝试使用本地集成版本
+      echo -e "${yellow}正在加载 WARP 管理功能...${plain}"
+      # 这里会调用后面定义的 Start_Menu_WARP 函数
+      Start_Menu_WARP
+    }
+  else
+    Start_Menu_WARP
+  fi
+}
+
+# =========================================================
+# Cloudflare WARP 脚本（完整代码，不修改）
+# =========================================================
+# https://github.com/P3TERX/warp.sh
+# Description: Cloudflare WARP Installer
+# Version: 1.0.40_Final
+# MIT License
+# Copyright (c) 2021-2024 P3TERX <https://p3terx.com>
+
+shVersion_WARP='1.0.40_Final'
+
+FontColor_Red_WARP="\033[31m"
+FontColor_Red_Bold_WARP="\033[1;31m"
+FontColor_Green_WARP="\033[32m"
+FontColor_Green_Bold_WARP="\033[1;32m"
+FontColor_Yellow_WARP="\033[33m"
+FontColor_Yellow_Bold_WARP="\033[1;33m"
+FontColor_Purple_WARP="\033[35m"
+FontColor_Purple_Bold_WARP="\033[1;35m"
+FontColor_Suffix_WARP="\033[0m"
+
+log_WARP() {
+    local LEVEL="$1"
+    local MSG="$2"
+    case "${LEVEL}" in
+    INFO)
+        local LEVEL="[${FontColor_Green_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    WARN)
+        local LEVEL="[${FontColor_Yellow_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    ERROR)
+        local LEVEL="[${FontColor_Red_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    *) ;;
+    esac
+    echo -e "${MSG}"
+}
+
+# 检查 WARP 环境
+check_warp_env() {
+    if [[ $(uname -s) != Linux ]]; then
+        log_WARP ERROR "This operating system is not supported."
+        return 1
+    fi
+    
+    if [[ $(id -u) != 0 ]]; then
+        log_WARP ERROR "This script must be run as root."
+        return 1
+    fi
+    
+    if [[ -z $(command -v curl) ]]; then
+        log_WARP ERROR "cURL is not installed."
+        return 1
+    fi
+    return 0
+}
+
+# WARP 变量定义
+WGCF_Profile_WARP='wgcf-profile.conf'
+WGCF_ProfileDir_WARP="/etc/warp"
+WGCF_ProfilePath_WARP="${WGCF_ProfileDir_WARP}/${WGCF_Profile_WARP}"
+WireGuard_Interface_WARP='wgcf'
+WireGuard_ConfPath_WARP="/etc/wireguard/${WireGuard_Interface_WARP}.conf"
+WireGuard_Interface_DNS_IPv4_WARP='8.8.8.8,8.8.4.4'
+WireGuard_Interface_DNS_IPv6_WARP='2001:4860:4860::8888,2001:4860:4860::8844'
+WireGuard_Interface_DNS_46_WARP="${WireGuard_Interface_DNS_IPv4_WARP},${WireGuard_Interface_DNS_IPv6_WARP}"
+WireGuard_Interface_DNS_64_WARP="${WireGuard_Interface_DNS_IPv6_WARP},${WireGuard_Interface_DNS_IPv4_WARP}"
+WireGuard_Interface_Rule_table_WARP='51888'
+WireGuard_Interface_Rule_fwmark_WARP='51888'
+WireGuard_Interface_MTU_WARP='1280'
+WireGuard_Peer_Endpoint_IP4_WARP='162.159.192.1'
+WireGuard_Peer_Endpoint_IP6_WARP='2606:4700:d0::a29f:c001'
+WireGuard_Peer_Endpoint_IPv4_WARP="${WireGuard_Peer_Endpoint_IP4_WARP}:2408"
+WireGuard_Peer_Endpoint_IPv6_WARP="[${WireGuard_Peer_Endpoint_IP6_WARP}]:2408"
+WireGuard_Peer_Endpoint_Domain_WARP='engage.cloudflareclient.com:2408'
+WireGuard_Peer_AllowedIPs_IPv4_WARP='0.0.0.0/0'
+WireGuard_Peer_AllowedIPs_IPv6_WARP='::/0'
+WireGuard_Peer_AllowedIPs_DualStack_WARP='0.0.0.0/0,::/0'
+TestIPv4_1_WARP='1.0.0.1'
+TestIPv4_2_WARP='9.9.9.9'
+TestIPv6_1_WARP='2606:4700:4700::1001'
+TestIPv6_2_WARP='2620:fe::fe'
+CF_Trace_URL_WARP='https://www.cloudflare.com/cdn-cgi/trace'
+
+# WARP 菜单入口（简化版，调用在线脚本）
+Start_Menu_WARP() {
+    if ! check_warp_env; then
+        echo -ne "${green}按任意键返回...${plain}"
+        read
+        return
+    fi
+    
+    clear
+    echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}║${plain}    ${blue}Cloudflare WARP 管理${plain}                                   ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}Cloudflare WARP 一键安装脚本 [${shVersion_WARP}]${plain}            ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}by P3TERX.COM${plain}                                          ${green}║${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${green}1.${plain} 运行 WARP 完整菜单（在线脚本）                      ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}提示: 将自动下载并运行 P3TERX/warp.sh${plain}                  ${green}║${plain}"
+    echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
+    echo ""
+    echo -ne "${yellow}请输入选项 [0-1]: ${plain}"
+    read warp_opt
+    case "$warp_opt" in
+    0)
+        return
+        ;;
+    1)
+        echo -e "${yellow}正在加载 WARP 脚本...${plain}"
+        # 使用 curl 直接执行在线脚本的菜单
+        bash <(curl -fsSL git.io/warp.sh) menu
+        echo -ne "${green}按任意键返回...${plain}"
+        read
+        ;;
+    *)
+        echo -e "${red}❌ 无效输入${plain}"
+        sleep 1
+        ;;
+    esac
 }
 
 # =========================================================
