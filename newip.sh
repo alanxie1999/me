@@ -237,6 +237,7 @@ REMOTE_VIP=${remote_vip}
 EOF
   chmod 600 "$tmp_env"
   mv -f "$tmp_env" "${ddns_conf_dir}/${tunname}.env"
+  echo -e "${Info} 配置文件已保存并设置为仅 root 可读 (权限 600)"
 
   if [[ ! -x "$keeper_script_path" ]]; then
     cat >"$keeper_script_path" <<'KEEPER_EOF'
@@ -562,6 +563,12 @@ install_ipip(){
   echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip)：${plain}"; read tunname
   [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
   
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$tunname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
+  
   # 检查是否已存在同名接口
   if ip link show "$tunname" &>/dev/null; then
     echo -e "${red}接口 ${tunname} 已存在${plain}"
@@ -602,11 +609,29 @@ install_ipip(){
 
   install_ddns_keeper "$tunname" "v4" "$ddnsname" "$localip" "$vip_cidr" "$remotevip"
 
+  # 清理可能存在的旧接口
   ip link show "$tunname" &>/dev/null && ip link set "$tunname" down &>/dev/null || true
   ip tunnel del "$tunname" &>/dev/null || true
-  ip tunnel add "$tunname" mode ipip remote "${remoteip}" local "${localip}" ttl 64
-  ip addr add "${vip_cidr}" dev "$tunname" || true
-  ip link set "$tunname" up
+  
+  # 创建隧道（添加错误检查）
+  if ! ip tunnel add "$tunname" mode ipip remote "${remoteip}" local "${localip}" ttl 64; then
+    echo -e "${red}创建 IPIP 隧道失败，请检查网络配置${plain}"
+    exit 1
+  fi
+  
+  # 配置 IP 地址
+  if ! ip addr add "${vip_cidr}" dev "$tunname" 2>/dev/null; then
+    echo -e "${yellow}警告: IP 地址可能已存在，继续...${plain}"
+  fi
+  
+  # 启动接口
+  if ! ip link set "$tunname" up; then
+    echo -e "${red}启动接口失败${plain}"
+    ip tunnel del "$tunname" &>/dev/null
+    exit 1
+  fi
+  
+  # 添加路由
   ip route replace "${remotevip}/32" dev "$tunname" scope link src "${vip}" 2>/dev/null || true
 
   if ! iptables -w -t nat -C POSTROUTING -s "${remotevip}" -j MASQUERADE 2>/dev/null; then
@@ -631,6 +656,12 @@ install_ipipv6(){
   # 输入 tunnel 名称
   echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip6)：${plain}"; read tunname
   [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
+  
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$tunname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
   
   # 检查是否已存在同名接口
   if ip link show "$tunname" &>/dev/null; then
@@ -664,11 +695,27 @@ install_ipipv6(){
 
   install_ddns_keeper "$tunname" "v6" "$ddnsname" "$localip6" "$vip_cidr" "$remotevip"
 
+  # 清理可能存在的旧接口
   ip link show "$tunname" &>/dev/null && ip link set "$tunname" down &>/dev/null || true
   ip -6 tunnel del "$tunname" &>/dev/null || true
-  ip link add name "$tunname" type ip6tnl local "${localip6}" remote "${remoteip}" mode any
-  ip -6 addr add "${vip_cidr}" dev "$tunname" || true
-  ip link set "$tunname" up
+  
+  # 创建 IPv6 隧道（添加错误检查）
+  if ! ip link add name "$tunname" type ip6tnl local "${localip6}" remote "${remoteip}" mode any; then
+    echo -e "${red}创建 IPIPv6 隧道失败，请检查网络配置${plain}"
+    exit 1
+  fi
+  
+  # 配置 IPv6 地址
+  if ! ip -6 addr add "${vip_cidr}" dev "$tunname" 2>/dev/null; then
+    echo -e "${yellow}警告: IPv6 地址可能已存在，继续...${plain}"
+  fi
+  
+  # 启动接口
+  if ! ip link set "$tunname" up; then
+    echo -e "${red}启动接口失败${plain}"
+    ip -6 tunnel del "$tunname" &>/dev/null
+    exit 1
+  fi
 
   if ! ip6tables -w -t nat -C POSTROUTING -s "${remotevip}" -j MASQUERADE 2>/dev/null; then
     ip6tables -w -t nat -A POSTROUTING -s "${remotevip}" -j MASQUERADE
@@ -852,6 +899,12 @@ install_wg(){
   # 输入配置信息
   echo -ne "${yellow}接口名 (如 wg0): ${plain}"; read filename
   [[ -z "$filename" ]] && { echo -e "${red}接口名不能为空${plain}"; exit 1; }
+  
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$filename" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
   config_file="/etc/wireguard/${filename}.conf"
   [[ -f "$config_file" ]] && { echo -e "${red}配置文件已存在: ${config_file}${plain}"; echo -e "${yellow}如需覆盖，请先卸载现有接口${plain}"; exit 1; }
   
@@ -980,6 +1033,7 @@ PersistentKeepalive = 25
 EOF
   chmod 600 "$config_file"
   echo -e "${green}配置文件已创建: ${config_file}${plain}"
+  echo -e "${yellow}注意: 配置文件包含私钥，已设置为仅 root 可读 (权限 600)${plain}"
   
   # 启动 WireGuard
   echo -e "${yellow}正在启动 WireGuard 接口...${plain}"
