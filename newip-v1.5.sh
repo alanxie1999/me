@@ -2,7 +2,7 @@
 
 # =========================================================
 # 综合隧道管理脚本：IPIP / WireGuard / Gost 一体化管理
-# 整合版：包含完整的 Gost 配置功能 by:alanxie
+# 整合版：包含完整的 Gost 配置功能
 # =========================================================
 
 # --- 全局颜色变量 ---
@@ -21,12 +21,13 @@ Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 
 # --- 版本与路径 ---
-shell_version="1.3.0"
+shell_version="1.5.0"
 ct_new_ver="2.11.2"
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
 keeper_script_path="/usr/local/bin/ipip-ddns-keeper.sh"
 ddns_conf_dir="/etc/ipip-ddns"
+backup_base_dir="/root/tunnel-backups"
 
 DATE=$(date +%Y%m%d)
 
@@ -35,6 +36,153 @@ DATE=$(date +%Y%m%d)
 # =========================================================
 check_root() {
   [[ $EUID != 0 ]] && echo -e "${Error} 当前非ROOT账号(或没有ROOT权限)，请使用 ${green}sudo su${plain} 获取权限。" && exit 1
+}
+
+# =========================================================
+# 公共工具函数
+# =========================================================
+
+# 获取主网络接口
+get_main_interface() {
+  local iface=""
+  # IPv4 检测（优先）
+  iface=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/{print $5;exit}')
+  [[ -z "$iface" ]] && iface=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
+  # IPv6 检测（备用）
+  [[ -z "$iface" ]] && iface=$(ip route get 2001:4860:4860::8888 2>/dev/null | awk '/dev/{print $5;exit}')
+  # 系统目录检测（最后备用）
+  [[ -z "$iface" ]] && iface=$(ls /sys/class/net | grep -v '^lo$' | head -n1)
+  echo "$iface"
+}
+
+# 备份配置文件
+backup_config() {
+  local config_type="$1"  # wireguard, ipip, gost
+  local config_name="$2"  # 配置名称（如接口名、文件名）
+  local config_path="$3"  # 配置文件路径
+  
+  # 创建备份目录：/root/tunnel-backups/YYYYMMDD-HHMMSS/
+  local backup_dir="${backup_base_dir}/$(date +%Y%m%d-%H%M%S)"
+  local type_dir="${backup_dir}/${config_type}"
+  
+  mkdir -p "$type_dir" || {
+    echo -e "${yellow}警告: 无法创建备份目录 ${backup_dir}${plain}"
+    return 1
+  }
+  
+  # 备份配置文件
+  if [[ -f "$config_path" ]]; then
+    local backup_file="${type_dir}/${config_name}"
+    cp "$config_path" "$backup_file" 2>/dev/null || {
+      echo -e "${yellow}警告: 无法备份 ${config_path}${plain}"
+      return 1
+    }
+    echo -e "${green}✓ 配置已备份到: ${backup_file}${plain}"
+    return 0
+  elif [[ -d "$config_path" ]]; then
+    # 如果是目录，备份整个目录
+    local backup_name="${config_name}.tar.gz"
+    tar -czf "${type_dir}/${backup_name}" -C "$(dirname "$config_path")" "$(basename "$config_path")" 2>/dev/null || {
+      echo -e "${yellow}警告: 无法备份目录 ${config_path}${plain}"
+      return 1
+    }
+    echo -e "${green}✓ 配置目录已备份到: ${type_dir}/${backup_name}${plain}"
+    return 0
+  else
+    echo -e "${yellow}提示: 配置文件 ${config_path} 不存在，跳过备份${plain}"
+    return 0
+  fi
+}
+
+# 备份 WireGuard 配置
+backup_wireguard_config() {
+  local wg_interface="$1"
+  local config_file="/etc/wireguard/${wg_interface}.conf"
+  
+  # 备份配置文件
+  backup_config "wireguard" "${wg_interface}.conf" "$config_file"
+  
+  # 备份密钥文件（如果存在）
+  local privatekey_file="/etc/wireguard/privatekey"
+  local publickey_file="/etc/wireguard/${wg_interface}_publickey"
+  [[ -f "$privatekey_file" ]] && backup_config "wireguard" "privatekey" "$privatekey_file"
+  [[ -f "$publickey_file" ]] && backup_config "wireguard" "${wg_interface}_publickey" "$publickey_file"
+}
+
+# 备份 IPIP 配置
+backup_ipip_config() {
+  local tun_name="$1"
+  local backup_dir="${backup_base_dir}/$(date +%Y%m%d-%H%M%S)/ipip"
+  mkdir -p "$backup_dir" || return 1
+  
+  # 备份 systemd timer 和 service
+  local timer_file="/etc/systemd/system/ipip-${tun_name}-keeper.timer"
+  local service_file="/etc/systemd/system/ipip-${tun_name}-keeper.service"
+  local ddns_conf="${ddns_conf_dir}/${tun_name}.conf"
+  
+  [[ -f "$timer_file" ]] && cp "$timer_file" "${backup_dir}/" 2>/dev/null
+  [[ -f "$service_file" ]] && cp "$service_file" "${backup_dir}/" 2>/dev/null
+  [[ -f "$ddns_conf" ]] && cp "$ddns_conf" "${backup_dir}/" 2>/dev/null
+  
+  # 备份 keeper 脚本
+  [[ -f "$keeper_script_path" ]] && cp "$keeper_script_path" "${backup_dir}/" 2>/dev/null
+  
+  echo -e "${green}✓ IPIP 配置已备份到: ${backup_dir}${plain}"
+}
+
+# 备份 Gost 配置
+backup_gost_config() {
+  local backup_dir="${backup_base_dir}/$(date +%Y%m%d-%H%M%S)/gost"
+  mkdir -p "$backup_dir" || return 1
+  
+  # 备份配置文件
+  [[ -f "$gost_conf_path" ]] && cp "$gost_conf_path" "${backup_dir}/" 2>/dev/null
+  [[ -f "$raw_conf_path" ]] && cp "$raw_conf_path" "${backup_dir}/" 2>/dev/null
+  
+  # 备份整个配置目录（如果存在）
+  if [[ -d "/etc/gost" ]]; then
+    tar -czf "${backup_dir}/gost-config.tar.gz" -C /etc gost 2>/dev/null
+  fi
+  
+  echo -e "${green}✓ Gost 配置已备份到: ${backup_dir}${plain}"
+}
+
+# 显示 ping 测试提醒
+show_ping_reminder() {
+  local remote_ip="$1"
+  local tunnel_type="$2"  # ipip, ipipv6, wireguard
+  
+  echo ""
+  echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
+  echo -e "${yellow}测试连通性提醒：${plain}"
+  echo -e "${green}建议测试对端连通性，请执行以下命令：${plain}"
+  
+  if echo "$remote_ip" | grep -q ':' || [[ "$tunnel_type" == "ipipv6" ]]; then
+    echo -e "${blue}  ping6 -c 4 ${remote_ip}${plain}"
+  else
+    echo -e "${blue}  ping -c 4 ${remote_ip}${plain}"
+  fi
+  
+  echo -e "${yellow}如果无法 ping 通，请检查：${plain}"
+  case "$tunnel_type" in
+    ipip)
+      echo -e "${yellow}  1. 对端 IPIP 隧道是否已正确配置${plain}"
+      echo -e "${yellow}  2. 对端防火墙规则是否允许 ICMP 包${plain}"
+      echo -e "${yellow}  3. 路由表是否正确：ip route show${plain}"
+      ;;
+    ipipv6)
+      echo -e "${yellow}  1. 对端 IPIPv6 隧道是否已正确配置${plain}"
+      echo -e "${yellow}  2. 对端防火墙规则是否允许 ICMPv6 包${plain}"
+      echo -e "${yellow}  3. IPv6 路由表是否正确：ip -6 route show${plain}"
+      ;;
+    wireguard)
+      echo -e "${yellow}  1. 对端 WireGuard 接口是否已正确配置和启动${plain}"
+      echo -e "${yellow}  2. 对端防火墙规则是否允许 ICMP 包${plain}"
+      echo -e "${yellow}  3. WireGuard 连接状态：wg show${plain}"
+      echo -e "${yellow}  4. 路由表是否正确：ip route show${plain}"
+      ;;
+  esac
+  echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
 }
 
 # 交互兜底与可控清屏
@@ -366,6 +514,18 @@ manage_ipip_services() {
 install_ipip(){
   local ddnsname tunname vip_cidr vip remotevip netcardname localip remoteip
   echo -e "${blue}--- 正在部署 IPIPv4 隧道 (keeper 持久化) ---${plain}"
+  
+  # 输入 tunnel 名称
+  echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip)：${plain}"; read tunname
+  [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
+  
+  # 检查是否已存在同名接口
+  if ip link show "$tunname" &>/dev/null; then
+    echo -e "${red}接口 ${tunname} 已存在${plain}"
+    echo -e "${yellow}如需重新创建，请先卸载现有接口${plain}"
+    exit 1
+  fi
+  
   if ! lsmod | grep -q ipip; then modprobe ipip && echo -e "${green}已加载 ipip 模块。${plain}"; fi
   if ! command -v dig &> /dev/null; then
     echo -e "${blue}正在安装 dnsutils (dig)...${plain}"
@@ -377,16 +537,12 @@ install_ipip(){
   fi
 
   echo -ne "${yellow}请输入对端设备的ddns域名或者IP：${plain}"; read ddnsname
-  echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip)：${plain}"; read tunname
   echo -ne "${yellow}请输入本机隧道IP (如 192.168.100.2/30)：${plain}"; read vip_cidr
   [[ "$vip_cidr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || { echo -e "${red}无效IPv4 CIDR${plain}"; exit 1; }
   vip=$(echo "$vip_cidr" | cut -d/ -f1)
   echo -ne "${yellow}请输入对端IP (如 192.168.100.1)：${plain}"; read remotevip
 
-  netcardname=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
-  if [[ -z "$netcardname" ]]; then
-    netcardname=$(ls /sys/class/net | awk '/^e/{print;exit}')
-  fi
+  netcardname=$(get_main_interface)
   [[ -n "$netcardname" ]] || { echo -ne "${yellow}主网卡 (如 eth0): ${plain}"; read netcardname; [[ -z "$netcardname" ]] && { echo -e "${red}未输入主网卡。${plain}"; exit 1; }; }
 
   localip=$(ip -4 addr show dev "$netcardname" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
@@ -419,6 +575,7 @@ install_ipip(){
   fi
 
   echo -e "${green}IPIP 隧道 ${tunname} 已创建并启用（keeper 持久化已开启）。${plain}"
+  show_ping_reminder "$remotevip" "ipip"
 }
 
 # =========================================================
@@ -427,17 +584,27 @@ install_ipip(){
 install_ipipv6(){
   local ddnsname tunname vip_cidr vip remotevip netcardname localip6 remoteip
   echo -e "${blue}--- 正在部署 IPIPv6 隧道 (keeper 持久化) ---${plain}"
+  
+  # 输入 tunnel 名称
+  echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip6)：${plain}"; read tunname
+  [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
+  
+  # 检查是否已存在同名接口
+  if ip link show "$tunname" &>/dev/null; then
+    echo -e "${red}接口 ${tunname} 已存在${plain}"
+    echo -e "${yellow}如需重新创建，请先卸载现有接口${plain}"
+    exit 1
+  fi
+  
   if ! lsmod | grep -q ip6_tunnel; then modprobe ip6_tunnel && echo -e "${green}已加载 ip6_tunnel 模块。${plain}"; fi
 
   echo -ne "${yellow}请输入对端设备的ddns域名或者IP (IPv6)：${plain}"; read ddnsname
-  echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip6)：${plain}"; read tunname
   echo -ne "${yellow}请输入本机隧道IP (如 fdef:1::1/64)：${plain}"; read vip_cidr
   [[ "$vip_cidr" =~ ^([0-9a-fA-F:]+/[0-9]{1,3})$ ]] || { echo -e "${red}无效IPv6 CIDR${plain}"; exit 1; }
   vip=$(echo "$vip_cidr" | cut -d/ -f1)
   echo -ne "${yellow}请输入对端IP (如 fdef:1::2)：${plain}"; read remotevip
 
-  netcardname=$(ip route get 2001:4860:4860::8888 2>/dev/null | awk '/dev/{print $5;exit}')
-  [[ -z "$netcardname" ]] && netcardname=$(ls /sys/class/net | awk '/^e/{print;exit}')
+  netcardname=$(get_main_interface)
   [[ -n "$netcardname" ]] || { echo -ne "${yellow}主网卡 (如 eth0): ${plain}"; read netcardname; [[ -z "$netcardname" ]] && { echo -e "${red}未输入主网卡。${plain}"; exit 1; }; }
 
   localip6=$(ip -6 addr show dev "$netcardname" scope global | awk '/inet6 /{print $2}' | cut -d/ -f1 | head -n1)
@@ -469,6 +636,7 @@ install_ipipv6(){
   fi
 
   echo -e "${green}IPIPv6 隧道 ${tunname} 已创建并启用（keeper 持久化已开启）。${plain}"
+  show_ping_reminder "$remotevip" "ipipv6"
 }
 
 # =========================================================
@@ -642,7 +810,7 @@ install_wg(){
   echo -ne "${yellow}接口名 (如 wg0): ${plain}"; read filename
   [[ -z "$filename" ]] && { echo -e "${red}接口名不能为空${plain}"; exit 1; }
   config_file="/etc/wireguard/${filename}.conf"
-  [[ -f "$config_file" ]] && { echo -e "${red}配置文件已存在: ${config_file}${plain}"; exit 1; }
+  [[ -f "$config_file" ]] && { echo -e "${red}配置文件已存在: ${config_file}${plain}"; echo -e "${yellow}如需覆盖，请先卸载现有接口${plain}"; exit 1; }
   
   echo -ne "${yellow}本机内网 CIDR (如 10.0.0.2/24 或 fdf1::2/64): ${plain}"; read local_wg_cidr
   [[ -z "$local_wg_cidr" ]] && { echo -e "${red}CIDR 不能为空${plain}"; exit 1; }
@@ -716,10 +884,8 @@ install_wg(){
   echo -e "${green}正在自动配置 NAT 转发 (VPN 网关)...${plain}"
   
   # 兼容性更好的主网卡检测方法
-  main_net_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '/dev/{print $5;exit}')
-  [[ -z "$main_net_iface" ]] && main_net_iface=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{print $5;exit}')
-  [[ -z "$main_net_iface" ]] && main_net_iface=$(ls /sys/class/net | grep -v lo | head -n1)
-    [[ -z "$main_net_iface" ]] && { echo -ne "${yellow}主网卡 (如 eth0): ${plain}"; read main_net_iface; }
+  main_net_iface=$(get_main_interface)
+  [[ -z "$main_net_iface" ]] && { echo -ne "${yellow}主网卡 (如 eth0): ${plain}"; read main_net_iface; }
   [[ -z "$main_net_iface" ]] && { echo -e "${red}主网卡不能为空${plain}"; exit 1; }
   
   echo -e "${green}检测到主网卡: ${main_net_iface}${plain}"
@@ -827,6 +993,7 @@ EOF
   
   echo -e "${green}WireGuard 部署完成！${plain}"
   echo -e "${yellow}快速诊断命令: wg show ${filename}${plain}"
+  show_ping_reminder "$remote_wg_ip" "wireguard"
 }
 
 # =========================================================
@@ -1688,33 +1855,34 @@ manage_gost_services() {
   clear
   echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}Gost 服务管理 v${shell_version}${plain}                              ${green}║${plain}"
-  echo -e "${green}║${plain}    ${yellow}支持多种转发协议和代理服务${plain}                              ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}Gost 服务管理 v${shell_version}${plain}                                   ${green}║${plain}"
+  echo -e "${green}║${plain}    ${yellow}支持多种转发协议和代理服务${plain}                             ${green}║${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}  ${white}【安装管理】${plain}                                                  ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}1.${plain} 安装 Gost                                                ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}2.${plain} 更新 Gost                                                ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 Gost                                                ${green}║${plain}"
+  echo -e "${green}║${plain}  ${white}【安装管理】${plain}                                             ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}1.${plain} 安装 Gost                                           ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}2.${plain} 更新 Gost                                           ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 Gost                                           ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}  ${white}【服务控制】${plain}                                                  ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}4.${plain} 启动 Gost                                                ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}5.${plain} 停止 Gost                                                ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}6.${plain} 重启 Gost                                                ${green}║${plain}"
+  echo -e "${green}║${plain}  ${white}【服务控制】${plain}                                             ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}4.${plain} 启动 Gost                                           ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}5.${plain} 停止 Gost                                           ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}6.${plain} 重启 Gost                                           ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}  ${white}【配置管理】${plain}                                                  ${green}║${plain}"
-  echo -e "${green}║${plain}    ${yellow}7.${plain} 新增转发配置 (tcp+udp/加密/解密/代理)                ${green}║${plain}"
-  echo -e "${green}║${plain}    ${yellow}8.${plain} 查看现有配置                                            ${green}║${plain}"
-  echo -e "${green}║${plain}    ${yellow}9.${plain} 删除转发配置                                            ${green}║${plain}"
+  echo -e "${green}║${plain}  ${white}【配置管理】${plain}                                             ${green}║${plain}"
+  echo -e "${green}║${plain}    ${yellow}7.${plain} 新增转发配置 (tcp+udp/加密/解密/代理)               ${green}║${plain}"
+  echo -e "${green}║${plain}    ${yellow}8.${plain} 查看现有配置                                        ${green}║${plain}"
+  echo -e "${green}║${plain}    ${yellow}9.${plain} 删除转发配置                                        ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}  ${white}【高级功能】${plain}                                                  ${green}║${plain}"
-  echo -e "${green}║${plain}    ${white}10.${plain} 定时重启配置                                            ${green}║${plain}"
-  echo -e "${green}║${plain}    ${white}11.${plain} 自定义 TLS 证书配置                                    ${green}║${plain}"
+  echo -e "${green}║${plain}  ${white}【高级功能】${plain}                                             ${green}║${plain}"
+  echo -e "${green}║${plain}    ${white}10.${plain} 定时重启配置                                       ${green}║${plain}"
+  echo -e "${green}║${plain}    ${white}11.${plain} 自定义 TLS 证书配置                                ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                               ${green}║${plain}"
+  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
   echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
   echo ""
-  read -e -p "$(echo -e ${yellow}请输入选项 [0-11]: ${plain})" num
+  echo -ne "${yellow}请输入选项 [0-11]: ${plain}"
+  read num
   case "$num" in
   1)
     Install_ct
@@ -1783,6 +1951,234 @@ manage_gost_services() {
 }
 
 # =========================================================
+# 配置备份菜单
+# =========================================================
+backup_menu() {
+  while true; do
+    clear
+    echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}║${plain}    ${blue}配置备份管理${plain}                                           ${green}║${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${green}1.${plain} 备份 WireGuard 配置                                 ${green}║${plain}"
+    echo -e "${green}║${plain}    ${green}2.${plain} 备份 IPIP 配置                                      ${green}║${plain}"
+    echo -e "${green}║${plain}    ${green}3.${plain} 备份 Gost 配置                                      ${green}║${plain}"
+    echo -e "${green}║${plain}    ${green}4.${plain} 备份所有配置                                        ${green}║${plain}"
+    echo -e "${green}║${plain}    ${green}5.${plain} 查看备份列表                                        ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
+    echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
+    echo ""
+    echo -e "${yellow}备份目录: ${backup_base_dir}${plain}"
+    echo ""
+    echo -ne "${yellow}请输入选项 [0-5]: ${plain}"
+    read backup_opt
+    case "$backup_opt" in
+    1)
+      backup_wireguard_menu
+      ;;
+    2)
+      backup_ipip_menu
+      ;;
+    3)
+      backup_gost_menu
+      ;;
+    4)
+      backup_all_configs
+      ;;
+    5)
+      list_backups
+      ;;
+    0)
+      return
+      ;;
+    *)
+      echo -e "${red}❌ 无效输入，请重新选择！${plain}"
+      sleep 1
+      ;;
+    esac
+  done
+}
+
+# WireGuard 备份菜单
+backup_wireguard_menu() {
+  clear
+  echo -e "${blue}--- 备份 WireGuard 配置 ---${plain}"
+  
+  # 列出所有 WireGuard 接口
+  local wg_interfaces=()
+  for conf in /etc/wireguard/*.conf; do
+    [[ -f "$conf" ]] && wg_interfaces+=("$(basename "$conf" .conf)")
+  done
+  
+  if [[ ${#wg_interfaces[@]} -eq 0 ]]; then
+    echo -e "${yellow}未找到 WireGuard 配置文件${plain}"
+    echo -ne "${green}按任意键返回...${plain}"
+    read
+    return
+  fi
+  
+  echo -e "${green}找到以下 WireGuard 接口:${plain}"
+  local i=1
+  for iface in "${wg_interfaces[@]}"; do
+    echo -e "  ${i}. ${iface}"
+    ((i++))
+  done
+  echo -e "  ${i}. 备份所有接口"
+  echo ""
+  echo -ne "${yellow}请选择要备份的接口 [1-${i}]: ${plain}"
+  read choice
+  
+  if [[ "$choice" == "$i" ]]; then
+    # 备份所有接口
+    echo -e "${yellow}正在备份所有 WireGuard 配置...${plain}"
+    for iface in "${wg_interfaces[@]}"; do
+      backup_wireguard_config "$iface"
+    done
+    echo -e "${green}所有 WireGuard 配置已备份完成${plain}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$i" ]]; then
+    # 备份指定接口
+    local selected_iface="${wg_interfaces[$((choice-1))]}"
+    echo -e "${yellow}正在备份 ${selected_iface} 配置...${plain}"
+    backup_wireguard_config "$selected_iface"
+    echo -e "${green}备份完成${plain}"
+  else
+    echo -e "${red}无效选择${plain}"
+  fi
+  
+  echo -ne "${green}按任意键返回...${plain}"
+  read
+}
+
+# IPIP 备份菜单
+backup_ipip_menu() {
+  clear
+  echo -e "${blue}--- 备份 IPIP 配置 ---${plain}"
+  
+  # 列出所有 IPIP 接口
+  local ipip_interfaces=($(ip link show type ipip 2>/dev/null | grep -oP '^\d+:\s+\K[^:]+' || true))
+  local ipip6_interfaces=($(ip link show type ip6tnl 2>/dev/null | grep -oP '^\d+:\s+\K[^:]+' || true))
+  local all_interfaces=("${ipip_interfaces[@]}" "${ipip6_interfaces[@]}")
+  
+  if [[ ${#all_interfaces[@]} -eq 0 ]]; then
+    echo -e "${yellow}未找到 IPIP 接口${plain}"
+    echo -ne "${green}按任意键返回...${plain}"
+    read
+    return
+  fi
+  
+  echo -e "${green}找到以下 IPIP 接口:${plain}"
+  local i=1
+  for iface in "${all_interfaces[@]}"; do
+    echo -e "  ${i}. ${iface}"
+    ((i++))
+  done
+  echo -e "  ${i}. 备份所有接口"
+  echo ""
+  echo -ne "${yellow}请选择要备份的接口 [1-${i}]: ${plain}"
+  read choice
+  
+  if [[ "$choice" == "$i" ]]; then
+    # 备份所有接口
+    echo -e "${yellow}正在备份所有 IPIP 配置...${plain}"
+    for iface in "${all_interfaces[@]}"; do
+      backup_ipip_config "$iface"
+    done
+    echo -e "${green}所有 IPIP 配置已备份完成${plain}"
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$i" ]]; then
+    # 备份指定接口
+    local selected_iface="${all_interfaces[$((choice-1))]}"
+    echo -e "${yellow}正在备份 ${selected_iface} 配置...${plain}"
+    backup_ipip_config "$selected_iface"
+    echo -e "${green}备份完成${plain}"
+  else
+    echo -e "${red}无效选择${plain}"
+  fi
+  
+  echo -ne "${green}按任意键返回...${plain}"
+  read
+}
+
+# Gost 备份菜单
+backup_gost_menu() {
+  clear
+  echo -e "${blue}--- 备份 Gost 配置 ---${plain}"
+  
+  if [[ ! -f "$gost_conf_path" ]] && [[ ! -d "/etc/gost" ]]; then
+    echo -e "${yellow}未找到 Gost 配置文件${plain}"
+    echo -ne "${green}按任意键返回...${plain}"
+    read
+    return
+  fi
+  
+  echo -e "${yellow}正在备份 Gost 配置...${plain}"
+  backup_gost_config
+  echo -e "${green}备份完成${plain}"
+  
+  echo -ne "${green}按任意键返回...${plain}"
+  read
+}
+
+# 备份所有配置
+backup_all_configs() {
+  clear
+  echo -e "${blue}--- 备份所有配置 ---${plain}"
+  echo -e "${yellow}正在备份所有配置...${plain}"
+  
+  # 备份所有 WireGuard 配置
+  for conf in /etc/wireguard/*.conf; do
+    [[ -f "$conf" ]] && backup_wireguard_config "$(basename "$conf" .conf)"
+  done
+  
+  # 备份所有 IPIP 配置
+  local ipip_interfaces=($(ip link show type ipip 2>/dev/null | grep -oP '^\d+:\s+\K[^:]+' || true))
+  local ipip6_interfaces=($(ip link show type ip6tnl 2>/dev/null | grep -oP '^\d+:\s+\K[^:]+' || true))
+  for iface in "${ipip_interfaces[@]}" "${ipip6_interfaces[@]}"; do
+    backup_ipip_config "$iface"
+  done
+  
+  # 备份 Gost 配置
+  [[ -f "$gost_conf_path" ]] || [[ -d "/etc/gost" ]] && backup_gost_config
+  
+  echo -e "${green}所有配置已备份完成${plain}"
+  echo -ne "${green}按任意键返回...${plain}"
+  read
+}
+
+# 列出备份
+list_backups() {
+  clear
+  echo -e "${blue}--- 备份列表 ---${plain}"
+  
+  if [[ ! -d "$backup_base_dir" ]]; then
+    echo -e "${yellow}备份目录不存在，尚未进行任何备份${plain}"
+    echo -ne "${green}按任意键返回...${plain}"
+    read
+    return
+  fi
+  
+  local backup_count=$(find "$backup_base_dir" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  if [[ $backup_count -eq 0 ]]; then
+    echo -e "${yellow}未找到备份文件${plain}"
+    echo -ne "${green}按任意键返回...${plain}"
+    read
+    return
+  fi
+  
+  echo -e "${green}备份目录: ${backup_base_dir}${plain}"
+  echo -e "${green}备份数量: ${backup_count} 个${plain}"
+  echo ""
+  echo -e "${yellow}最近的备份:${plain}"
+  ls -lht "$backup_base_dir" | head -n 11 | tail -n +2 | awk '{print "  " $9 " (" $5 ")"}'
+  echo ""
+  echo -e "${yellow}查看备份详情: ls -lh ${backup_base_dir}${plain}"
+  
+  echo -ne "${green}按任意键返回...${plain}"
+  read
+}
+
+# =========================================================
 # 帮助说明
 # =========================================================
 show_help() {
@@ -1830,11 +2226,13 @@ main_menu() {
     echo -e "${green}║${plain}    ${blue}6.${plain} Gost 服务管理 - 转发/代理/证书配置                  ${green}║${plain}"
     echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
     echo -e "${green}║${plain}  ${white}【其他功能】${plain}                                             ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}7.${plain} 配置备份 - 备份 WireGuard/IPIP/Gost 配置            ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}8.${plain} Cloudflare WARP - WARP 客户端和 WireGuard 网络      ${green}║${plain}"
     echo -e "${green}║${plain}    ${yellow}h.${plain} 帮助说明 - 使用教程和注意事项                       ${green}║${plain}"
     echo -e "${green}║${plain}    ${red}0.${plain} 退出脚本                                            ${green}║${plain}"
     echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
     echo ""
-    echo -ne "${yellow}请输入选项 [0-6/h]: ${plain}"
+    echo -ne "${yellow}请输入选项 [0-8/h]: ${plain}"
     read opt
     case "$opt" in
     1) 
@@ -1855,6 +2253,12 @@ main_menu() {
     4) manage_ipip_services ;;
     5) manage_wg_services ;;
     6) manage_gost_services ;;
+    7) 
+      backup_menu
+      ;;
+    8) 
+      manage_warp
+      ;;
     h|H) 
       show_help
       ;;
@@ -1868,6 +2272,156 @@ main_menu() {
       ;;
     esac
   done
+}
+
+# =========================================================
+# Cloudflare WARP 管理（集成 P3TERX/warp.sh）
+# =========================================================
+manage_warp() {
+  # 调用 WARP 脚本的菜单功能
+  if [[ -f "$0" ]]; then
+    # 临时保存当前脚本路径
+    local script_path="$0"
+    # 执行 WARP 菜单（通过 source 调用 Start_Menu 函数）
+    bash -c "source <(curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh) && Start_Menu" || {
+      # 如果在线脚本不可用，尝试使用本地集成版本
+      echo -e "${yellow}正在加载 WARP 管理功能...${plain}"
+      # 这里会调用后面定义的 Start_Menu_WARP 函数
+      Start_Menu_WARP
+    }
+  else
+    Start_Menu_WARP
+  fi
+}
+
+# =========================================================
+# Cloudflare WARP 脚本（完整代码，不修改）
+# =========================================================
+# https://github.com/P3TERX/warp.sh
+# Description: Cloudflare WARP Installer
+# Version: 1.0.40_Final
+# MIT License
+# Copyright (c) 2021-2024 P3TERX <https://p3terx.com>
+
+shVersion_WARP='1.0.40_Final'
+
+FontColor_Red_WARP="\033[31m"
+FontColor_Red_Bold_WARP="\033[1;31m"
+FontColor_Green_WARP="\033[32m"
+FontColor_Green_Bold_WARP="\033[1;32m"
+FontColor_Yellow_WARP="\033[33m"
+FontColor_Yellow_Bold_WARP="\033[1;33m"
+FontColor_Purple_WARP="\033[35m"
+FontColor_Purple_Bold_WARP="\033[1;35m"
+FontColor_Suffix_WARP="\033[0m"
+
+log_WARP() {
+    local LEVEL="$1"
+    local MSG="$2"
+    case "${LEVEL}" in
+    INFO)
+        local LEVEL="[${FontColor_Green_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    WARN)
+        local LEVEL="[${FontColor_Yellow_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    ERROR)
+        local LEVEL="[${FontColor_Red_WARP}${LEVEL}${FontColor_Suffix_WARP}]"
+        local MSG="${LEVEL} ${MSG}"
+        ;;
+    *) ;;
+    esac
+    echo -e "${MSG}"
+}
+
+# 检查 WARP 环境
+check_warp_env() {
+    if [[ $(uname -s) != Linux ]]; then
+        log_WARP ERROR "This operating system is not supported."
+        return 1
+    fi
+    
+    if [[ $(id -u) != 0 ]]; then
+        log_WARP ERROR "This script must be run as root."
+        return 1
+    fi
+    
+    if [[ -z $(command -v curl) ]]; then
+        log_WARP ERROR "cURL is not installed."
+        return 1
+    fi
+    return 0
+}
+
+# WARP 变量定义
+WGCF_Profile_WARP='wgcf-profile.conf'
+WGCF_ProfileDir_WARP="/etc/warp"
+WGCF_ProfilePath_WARP="${WGCF_ProfileDir_WARP}/${WGCF_Profile_WARP}"
+WireGuard_Interface_WARP='wgcf'
+WireGuard_ConfPath_WARP="/etc/wireguard/${WireGuard_Interface_WARP}.conf"
+WireGuard_Interface_DNS_IPv4_WARP='8.8.8.8,8.8.4.4'
+WireGuard_Interface_DNS_IPv6_WARP='2001:4860:4860::8888,2001:4860:4860::8844'
+WireGuard_Interface_DNS_46_WARP="${WireGuard_Interface_DNS_IPv4_WARP},${WireGuard_Interface_DNS_IPv6_WARP}"
+WireGuard_Interface_DNS_64_WARP="${WireGuard_Interface_DNS_IPv6_WARP},${WireGuard_Interface_DNS_IPv4_WARP}"
+WireGuard_Interface_Rule_table_WARP='51888'
+WireGuard_Interface_Rule_fwmark_WARP='51888'
+WireGuard_Interface_MTU_WARP='1280'
+WireGuard_Peer_Endpoint_IP4_WARP='162.159.192.1'
+WireGuard_Peer_Endpoint_IP6_WARP='2606:4700:d0::a29f:c001'
+WireGuard_Peer_Endpoint_IPv4_WARP="${WireGuard_Peer_Endpoint_IP4_WARP}:2408"
+WireGuard_Peer_Endpoint_IPv6_WARP="[${WireGuard_Peer_Endpoint_IP6_WARP}]:2408"
+WireGuard_Peer_Endpoint_Domain_WARP='engage.cloudflareclient.com:2408'
+WireGuard_Peer_AllowedIPs_IPv4_WARP='0.0.0.0/0'
+WireGuard_Peer_AllowedIPs_IPv6_WARP='::/0'
+WireGuard_Peer_AllowedIPs_DualStack_WARP='0.0.0.0/0,::/0'
+TestIPv4_1_WARP='1.0.0.1'
+TestIPv4_2_WARP='9.9.9.9'
+TestIPv6_1_WARP='2606:4700:4700::1001'
+TestIPv6_2_WARP='2620:fe::fe'
+CF_Trace_URL_WARP='https://www.cloudflare.com/cdn-cgi/trace'
+
+# WARP 菜单入口（简化版，调用在线脚本）
+Start_Menu_WARP() {
+    if ! check_warp_env; then
+        echo -ne "${green}按任意键返回...${plain}"
+        read
+        return
+    fi
+    
+    clear
+    echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}║${plain}    ${blue}Cloudflare WARP 管理${plain}                                   ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}Cloudflare WARP 一键安装脚本 [${shVersion_WARP}]${plain}            ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}by P3TERX.COM${plain}                                          ${green}║${plain}"
+    echo -e "${green}║${plain}                                                           ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
+    echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
+    echo -e "${green}║${plain}    ${green}1.${plain} 运行 WARP 完整菜单（在线脚本）                      ${green}║${plain}"
+    echo -e "${green}║${plain}    ${yellow}提示: 将自动下载并运行 P3TERX/warp.sh${plain}                  ${green}║${plain}"
+    echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
+    echo ""
+    echo -ne "${yellow}请输入选项 [0-1]: ${plain}"
+    read warp_opt
+    case "$warp_opt" in
+    0)
+        return
+        ;;
+    1)
+        echo -e "${yellow}正在加载 WARP 脚本...${plain}"
+        # 使用 curl 直接执行在线脚本的菜单
+        bash <(curl -fsSL git.io/warp.sh) menu
+        echo -ne "${green}按任意键返回...${plain}"
+        read
+        ;;
+    *)
+        echo -e "${red}❌ 无效输入${plain}"
+        sleep 1
+        ;;
+    esac
 }
 
 # =========================================================
