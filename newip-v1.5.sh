@@ -21,7 +21,7 @@ Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 
 # --- 版本与路径 ---
-shell_version="1.5.0"
+shell_version="1.6.0"
 ct_new_ver="2.11.2"
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -225,14 +225,19 @@ install_ddns_keeper() {
   local tunname="$1" mode="$2" ddns="$3" local_ip="$4" vip_cidr="$5" remote_vip="$6"
 
   install -d -m 755 "$ddns_conf_dir"
-  cat >"${ddns_conf_dir}/${tunname}.env" <<EOF
+  # 原子写入 env，避免半写导致配置丢失
+  local tmp_env
+  tmp_env="$(mktemp "${ddns_conf_dir}/${tunname}.env.XXXXXX")"
+  cat >"$tmp_env" <<EOF
 MODE=${mode}
 DDNS_NAME=${ddns}
 LOCAL_IP=${local_ip}
 VIP_CIDR=${vip_cidr}
 REMOTE_VIP=${remote_vip}
 EOF
-  chmod 600 "${ddns_conf_dir}/${tunname}.env"
+  chmod 600 "$tmp_env"
+  mv -f "$tmp_env" "${ddns_conf_dir}/${tunname}.env"
+  echo -e "${Info} 配置文件已保存并设置为仅 root 可读 (权限 600)"
 
   if [[ ! -x "$keeper_script_path" ]]; then
     cat >"$keeper_script_path" <<'KEEPER_EOF'
@@ -250,6 +255,7 @@ CONF_FILE="${CONF_DIR}/${TUN_NAME}.env"
 STATE_DIR="/run/ipip-ddns"
 mkdir -p "$STATE_DIR"
 STATE_FILE="${STATE_DIR}/${TUN_NAME}.state"
+PERSIST_FILE="${CONF_DIR}/${TUN_NAME}.state"
 LOCK_FILE="${STATE_DIR}/${TUN_NAME}.lock"
 
 if [[ ! -f "$CONF_FILE" ]]; then
@@ -279,22 +285,72 @@ resolve_ip() {
 
 with_lock() { exec 9>"$LOCK_FILE"; flock -n 9; }
 
+# 解析（带重试）
+resolve_ip_try() {
+  local name="$1" mode="$2" ip="" attempt=0
+  while (( attempt < 3 )); do
+    if [[ "$mode" == "v6" ]]; then
+      ip=$(getent hosts "$name" | awk '{print $1}' | grep -E '^[0-9a-fA-F:]+$' | head -n1 || true)
+      [[ -z "$ip" ]] && ip=$(dig +short AAAA "$name" | head -n1 || true)
+    else
+      ip=$(getent hosts "$name" | awk '{print $1}' | grep -E '^[0-9.]+$' | head -n1 || true)
+      [[ -z "$ip" ]] && ip=$(dig +short A "$name" | head -n1 || true)
+    fi
+    [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+    sleep 1; ((attempt++))
+  done
+  echo ""
+}
+
+# 幂等重建接口/地址/路由
+ensure_ipip_stack() {
+  local name="$1" mode="$2" local_ip="$3" remote_ip="$4" vip_cidr="$5" remote_vip="$6"
+  ip link set "$name" down 2>/dev/null || true
+  if [[ "$mode" == "v6" ]]; then
+    ip -6 tunnel del "$name" 2>/dev/null || true
+    ip link add name "$name" type ip6tnl local "$local_ip" remote "$remote_ip" mode any
+    ip -6 addr add "$vip_cidr" dev "$name" 2>/dev/null || true
+  else
+    ip tunnel del "$name" 2>/dev/null || true
+    ip tunnel add "$name" mode ipip remote "$remote_ip" local "$local_ip" ttl 64
+    ip addr add "$vip_cidr" dev "$name" 2>/dev/null || true
+  fi
+  ip link set "$name" up
+  if [[ -n "$remote_vip" ]]; then
+    if [[ "$remote_vip" == *:* ]]; then
+      ip -6 route replace "${remote_vip}/128" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null || true
+    else
+      ip route replace "${remote_vip}/32" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null || true
+    fi
+  fi
+}
+
 REMOTE_IP=""
 if [[ "$DDNS_NAME" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$DDNS_NAME" =~ ^[0-9a-fA-F:]+$ ]]; then
   REMOTE_IP="$DDNS_NAME"
 else
-  REMOTE_IP="$(resolve_ip)"
+  REMOTE_IP="$(resolve_ip_try "$DDNS_NAME" "$MODE")"
 fi
 
 if [[ -z "$REMOTE_IP" ]]; then
-  echo "$(date) $TUN_NAME: resolve failed for $DDNS_NAME" >&2
-  exit 0
+  PREV_REMOTE_LOCAL="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  [[ -z "$PREV_REMOTE_LOCAL" ]] && PREV_REMOTE_LOCAL="$(cat "$PERSIST_FILE" 2>/dev/null || true)"
+  if [[ -n "$PREV_REMOTE_LOCAL" ]]; then
+    echo "$(date) $TUN_NAME: DNS 解析失败，使用历史远端 $PREV_REMOTE_LOCAL 进行恢复" >&2
+    ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$PREV_REMOTE_LOCAL" "$VIP_CIDR" "$REMOTE_VIP"
+    echo "$PREV_REMOTE_LOCAL" >"$STATE_FILE" 2>/dev/null || true
+    exit 0
+  else
+    echo "$(date) $TUN_NAME: resolve failed and no previous IP" >&2
+    exit 0
+  fi
 fi
 
 with_lock || exit 0
 
 PREV_REMOTE="$(cat "$STATE_FILE" 2>/dev/null || true)"
 if [[ "$REMOTE_IP" == "$PREV_REMOTE" ]]; then
+  ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$REMOTE_IP" "$VIP_CIDR" "$REMOTE_VIP"
   exit 0
 fi
 
@@ -325,23 +381,8 @@ rollback() {
 }
 trap rollback ERR
 
-if [[ "$MODE" == "v6" ]]; then
-  ip link set "$TUN_NAME" down 2>/dev/null || true
-  ip -6 tunnel del "$TUN_NAME" 2>/dev/null || true
-  ip link add name "$TUN_NAME" type ip6tnl local "$LOCAL_IP" remote "$REMOTE_IP" mode any
-  ip -6 addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
-  ip link set "$TUN_NAME" up
-else
-  ip link set "$TUN_NAME" down 2>/dev/null || true
-  ip tunnel del "$TUN_NAME" 2>/dev/null || true
-  ip tunnel add "$TUN_NAME" mode ipip remote "$REMOTE_IP" local "$LOCAL_IP" ttl 64
-  ip addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
-  ip link set "$TUN_NAME" up
-fi
-
-if [[ -n "$REMOTE_VIP" ]]; then
-  ip route replace "${REMOTE_VIP}/32" dev "$TUN_NAME" scope link src "${VIP_CIDR%/*}" 2>/dev/null || true
-fi
+# IP 变更，重建
+ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$REMOTE_IP" "$VIP_CIDR" "$REMOTE_VIP"
 
 for conf in /etc/wireguard/*.conf; do
   [[ -f "$conf" ]] || continue
@@ -352,6 +393,7 @@ for conf in /etc/wireguard/*.conf; do
 done
 
 echo "$REMOTE_IP" >"$STATE_FILE"
+echo "$REMOTE_IP" >"$PERSIST_FILE" 2>/dev/null || true
 exit 0
 KEEPER_EOF
     chmod 755 "$keeper_script_path"
@@ -361,7 +403,7 @@ KEEPER_EOF
     cat >/etc/systemd/system/ipip-ddns@.service <<'SERVICE_EOF'
 [Unit]
 Description=IPIP DDNS keeper (%i)
-After=network-online.target
+After=network-online.target nss-lookup.target systemd-resolved.service
 Wants=network-online.target
 
 [Service]
@@ -369,6 +411,8 @@ Type=oneshot
 ExecStart=/usr/local/bin/ipip-ddns-keeper.sh %i
 Nice=5
 IOSchedulingClass=best-effort
+Restart=on-failure
+RestartSec=5s
 SERVICE_EOF
   fi
 
@@ -378,7 +422,7 @@ SERVICE_EOF
 Description=IPIP DDNS keeper timer (%i)
 
 [Timer]
-OnBootSec=30s
+OnBootSec=60s
 OnUnitActiveSec=2min
 AccuracySec=30s
 Persistent=true
@@ -465,14 +509,14 @@ manage_ipip_services() {
   clear
   echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}IPIP 隧道服务管理${plain}                                          ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}IPIP 隧道服务管理${plain}                                      ${green}║${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}    ${green}1.${plain} 查看所有 IPIP 接口 (IPv4/IPv6)                         ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}2.${plain} 重建/重启 IPIP 接口 (调用 keeper 自愈)                  ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 IPIP 接口                                         ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}1.${plain} 查看所有 IPIP 接口 (IPv4/IPv6)                      ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}2.${plain} 重建/重启 IPIP 接口 (调用 keeper 自愈)              ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 IPIP 接口                                      ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                               ${green}║${plain}"
+  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
   echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
   echo ""
   echo -ne "${yellow}请输入选项 [0-3]: ${plain}"
@@ -519,6 +563,12 @@ install_ipip(){
   echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip)：${plain}"; read tunname
   [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
   
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$tunname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
+  
   # 检查是否已存在同名接口
   if ip link show "$tunname" &>/dev/null; then
     echo -e "${red}接口 ${tunname} 已存在${plain}"
@@ -559,11 +609,29 @@ install_ipip(){
 
   install_ddns_keeper "$tunname" "v4" "$ddnsname" "$localip" "$vip_cidr" "$remotevip"
 
+  # 清理可能存在的旧接口
   ip link show "$tunname" &>/dev/null && ip link set "$tunname" down &>/dev/null || true
   ip tunnel del "$tunname" &>/dev/null || true
-  ip tunnel add "$tunname" mode ipip remote "${remoteip}" local "${localip}" ttl 64
-  ip addr add "${vip_cidr}" dev "$tunname" || true
-  ip link set "$tunname" up
+  
+  # 创建隧道（添加错误检查）
+  if ! ip tunnel add "$tunname" mode ipip remote "${remoteip}" local "${localip}" ttl 64; then
+    echo -e "${red}创建 IPIP 隧道失败，请检查网络配置${plain}"
+    exit 1
+  fi
+  
+  # 配置 IP 地址
+  if ! ip addr add "${vip_cidr}" dev "$tunname" 2>/dev/null; then
+    echo -e "${yellow}警告: IP 地址可能已存在，继续...${plain}"
+  fi
+  
+  # 启动接口
+  if ! ip link set "$tunname" up; then
+    echo -e "${red}启动接口失败${plain}"
+    ip tunnel del "$tunname" &>/dev/null
+    exit 1
+  fi
+  
+  # 添加路由
   ip route replace "${remotevip}/32" dev "$tunname" scope link src "${vip}" 2>/dev/null || true
 
   if ! iptables -w -t nat -C POSTROUTING -s "${remotevip}" -j MASQUERADE 2>/dev/null; then
@@ -588,6 +656,12 @@ install_ipipv6(){
   # 输入 tunnel 名称
   echo -ne "${yellow}请输入要创建的tun网卡名称(例如 ipip6)：${plain}"; read tunname
   [[ -z "$tunname" ]] && { echo -e "${red}tun网卡名称不能为空${plain}"; exit 1; }
+  
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$tunname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
   
   # 检查是否已存在同名接口
   if ip link show "$tunname" &>/dev/null; then
@@ -621,11 +695,27 @@ install_ipipv6(){
 
   install_ddns_keeper "$tunname" "v6" "$ddnsname" "$localip6" "$vip_cidr" "$remotevip"
 
+  # 清理可能存在的旧接口
   ip link show "$tunname" &>/dev/null && ip link set "$tunname" down &>/dev/null || true
   ip -6 tunnel del "$tunname" &>/dev/null || true
-  ip link add name "$tunname" type ip6tnl local "${localip6}" remote "${remoteip}" mode any
-  ip -6 addr add "${vip_cidr}" dev "$tunname" || true
-  ip link set "$tunname" up
+  
+  # 创建 IPv6 隧道（添加错误检查）
+  if ! ip link add name "$tunname" type ip6tnl local "${localip6}" remote "${remoteip}" mode any; then
+    echo -e "${red}创建 IPIPv6 隧道失败，请检查网络配置${plain}"
+    exit 1
+  fi
+  
+  # 配置 IPv6 地址
+  if ! ip -6 addr add "${vip_cidr}" dev "$tunname" 2>/dev/null; then
+    echo -e "${yellow}警告: IPv6 地址可能已存在，继续...${plain}"
+  fi
+  
+  # 启动接口
+  if ! ip link set "$tunname" up; then
+    echo -e "${red}启动接口失败${plain}"
+    ip -6 tunnel del "$tunname" &>/dev/null
+    exit 1
+  fi
 
   if ! ip6tables -w -t nat -C POSTROUTING -s "${remotevip}" -j MASQUERADE 2>/dev/null; then
     ip6tables -w -t nat -A POSTROUTING -s "${remotevip}" -j MASQUERADE
@@ -709,14 +799,14 @@ manage_wg_services() {
   clear
   echo -e "${green}╔═══════════════════════════════════════════════════════════╗${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
-  echo -e "${green}║${plain}    ${blue}WireGuard 隧道服务管理${plain}                                    ${green}║${plain}"
+  echo -e "${green}║${plain}    ${blue}WireGuard 隧道服务管理${plain}                                 ${green}║${plain}"
   echo -e "${green}║${plain}                                                           ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}    ${green}1.${plain} 查看所有 WireGuard 接口                               ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}2.${plain} 重启 WireGuard 接口                                    ${green}║${plain}"
-  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 WireGuard 接口                                    ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}1.${plain} 查看所有 WireGuard 接口                             ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}2.${plain} 重启 WireGuard 接口                                 ${green}║${plain}"
+  echo -e "${green}║${plain}    ${green}3.${plain} 卸载 WireGuard 接口                                 ${green}║${plain}"
   echo -e "${green}╠═══════════════════════════════════════════════════════════╣${plain}"
-  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                               ${green}║${plain}"
+  echo -e "${green}║${plain}    ${red}0.${plain} 返回主菜单                                          ${green}║${plain}"
   echo -e "${green}╚═══════════════════════════════════════════════════════════╝${plain}"
   echo ""
   echo -ne "${yellow}请输入选项 [0-3]: ${plain}"
@@ -809,6 +899,12 @@ install_wg(){
   # 输入配置信息
   echo -ne "${yellow}接口名 (如 wg0): ${plain}"; read filename
   [[ -z "$filename" ]] && { echo -e "${red}接口名不能为空${plain}"; exit 1; }
+  
+  # 验证接口名称（防止命令注入）
+  if [[ ! "$filename" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${red}接口名只能包含字母、数字、下划线和连字符${plain}"
+    exit 1
+  fi
   config_file="/etc/wireguard/${filename}.conf"
   [[ -f "$config_file" ]] && { echo -e "${red}配置文件已存在: ${config_file}${plain}"; echo -e "${yellow}如需覆盖，请先卸载现有接口${plain}"; exit 1; }
   
@@ -937,6 +1033,7 @@ PersistentKeepalive = 25
 EOF
   chmod 600 "$config_file"
   echo -e "${green}配置文件已创建: ${config_file}${plain}"
+  echo -e "${yellow}注意: 配置文件包含私钥，已设置为仅 root 可读 (权限 600)${plain}"
   
   # 启动 WireGuard
   echo -e "${yellow}正在启动 WireGuard 接口...${plain}"
@@ -2431,4 +2528,3 @@ check_root
 # 静默检查更新（已禁用，避免干扰）
 # update_sh
 main_menu
-
