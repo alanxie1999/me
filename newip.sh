@@ -21,7 +21,7 @@ Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 
 # --- 版本与路径 ---
-shell_version="1.6.0"
+shell_version="1.7.0"
 ct_new_ver="2.11.2"
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -305,24 +305,64 @@ resolve_ip_try() {
 # 幂等重建接口/地址/路由
 ensure_ipip_stack() {
   local name="$1" mode="$2" local_ip="$3" remote_ip="$4" vip_cidr="$5" remote_vip="$6"
+  
+  # 关闭接口
   ip link set "$name" down 2>/dev/null || true
+  
   if [[ "$mode" == "v6" ]]; then
+    # 删除旧隧道
     ip -6 tunnel del "$name" 2>/dev/null || true
-    ip link add name "$name" type ip6tnl local "$local_ip" remote "$remote_ip" mode any
-    ip -6 addr add "$vip_cidr" dev "$name" 2>/dev/null || true
+    
+    # 创建新隧道
+    if ! ip link add name "$name" type ip6tnl local "$local_ip" remote "$remote_ip" mode any 2>/dev/null; then
+      echo "$(date) $name: 创建 IPv6 隧道失败" >&2
+      return 1
+    fi
+    
+    # 清理旧地址并添加新地址
+    ip -6 addr flush dev "$name" 2>/dev/null || true
+    if ! ip -6 addr add "$vip_cidr" dev "$name" 2>/dev/null; then
+      echo "$(date) $name: 添加 IPv6 地址失败" >&2
+      return 1
+    fi
   else
+    # 删除旧隧道
     ip tunnel del "$name" 2>/dev/null || true
-    ip tunnel add "$name" mode ipip remote "$remote_ip" local "$local_ip" ttl 64
-    ip addr add "$vip_cidr" dev "$name" 2>/dev/null || true
-  fi
-  ip link set "$name" up
-  if [[ -n "$remote_vip" ]]; then
-    if [[ "$remote_vip" == *:* ]]; then
-      ip -6 route replace "${remote_vip}/128" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null || true
-    else
-      ip route replace "${remote_vip}/32" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null || true
+    
+    # 创建新隧道
+    if ! ip tunnel add "$name" mode ipip remote "$remote_ip" local "$local_ip" ttl 64 2>/dev/null; then
+      echo "$(date) $name: 创建 IPIP 隧道失败" >&2
+      return 1
+    fi
+    
+    # 清理旧地址并添加新地址
+    ip addr flush dev "$name" 2>/dev/null || true
+    if ! ip addr add "$vip_cidr" dev "$name" 2>/dev/null; then
+      echo "$(date) $name: 添加 IP 地址失败" >&2
+      return 1
     fi
   fi
+  
+  # 启动接口
+  if ! ip link set "$name" up 2>/dev/null; then
+    echo "$(date) $name: 启动接口失败" >&2
+    return 1
+  fi
+  
+  # 添加路由
+  if [[ -n "$remote_vip" ]]; then
+    if [[ "$remote_vip" == *:* ]]; then
+      if ! ip -6 route replace "${remote_vip}/128" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null; then
+        echo "$(date) $name: 添加 IPv6 路由失败" >&2
+      fi
+    else
+      if ! ip route replace "${remote_vip}/32" dev "$name" scope link src "${vip_cidr%/*}" 2>/dev/null; then
+        echo "$(date) $name: 添加路由失败" >&2
+      fi
+    fi
+  fi
+  
+  return 0
 }
 
 REMOTE_IP=""
@@ -355,35 +395,58 @@ if [[ "$REMOTE_IP" == "$PREV_REMOTE" ]]; then
 fi
 
 HAS_ROUTE="0"
-if ip route show | grep -qE "^${REMOTE_VIP}/32 dev ${TUN_NAME}"; then
-  HAS_ROUTE="1"
+if [[ "$MODE" == "v6" ]]; then
+  if ip -6 route show | grep -qE "^${REMOTE_VIP}/128 dev ${TUN_NAME}"; then
+    HAS_ROUTE="1"
+  fi
+else
+  if ip route show | grep -qE "^${REMOTE_VIP}/32 dev ${TUN_NAME}"; then
+    HAS_ROUTE="1"
+  fi
 fi
 
 rollback() {
   if [[ -n "$PREV_REMOTE" ]]; then
+    echo "$(date) $TUN_NAME: 配置失败，回滚到之前的远端 IP: $PREV_REMOTE" >&2
     if [[ "$MODE" == "v6" ]]; then
       ip link set "$TUN_NAME" down 2>/dev/null || true
       ip -6 tunnel del "$TUN_NAME" 2>/dev/null || true
-      ip link add name "$TUN_NAME" type ip6tnl local "$LOCAL_IP" remote "$PREV_REMOTE" mode any
-      ip -6 addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
-      ip link set "$TUN_NAME" up
+      if ip link add name "$TUN_NAME" type ip6tnl local "$LOCAL_IP" remote "$PREV_REMOTE" mode any 2>/dev/null; then
+        ip -6 addr flush dev "$TUN_NAME" 2>/dev/null || true
+        ip -6 addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
+        ip link set "$TUN_NAME" up 2>/dev/null || true
+      else
+        echo "$(date) $TUN_NAME: 回滚失败，无法创建 IPv6 隧道" >&2
+      fi
     else
       ip link set "$TUN_NAME" down 2>/dev/null || true
       ip tunnel del "$TUN_NAME" 2>/dev/null || true
-      ip tunnel add "$TUN_NAME" mode ipip remote "$PREV_REMOTE" local "$LOCAL_IP" ttl 64
-      ip addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
-      ip link set "$TUN_NAME" up
+      if ip tunnel add "$TUN_NAME" mode ipip remote "$PREV_REMOTE" local "$LOCAL_IP" ttl 64 2>/dev/null; then
+        ip addr flush dev "$TUN_NAME" 2>/dev/null || true
+        ip addr add "$VIP_CIDR" dev "$TUN_NAME" 2>/dev/null || true
+        ip link set "$TUN_NAME" up 2>/dev/null || true
+      else
+        echo "$(date) $TUN_NAME: 回滚失败，无法创建 IPIP 隧道" >&2
+      fi
     fi
     if [[ "$HAS_ROUTE" == "1" ]]; then
-      ip route replace "${REMOTE_VIP}/32" dev "$TUN_NAME" scope link src "${VIP_CIDR%/*}" 2>/dev/null || true
+      if [[ "$MODE" == "v6" ]]; then
+        ip -6 route replace "${REMOTE_VIP}/128" dev "$TUN_NAME" scope link src "${VIP_CIDR%/*}" 2>/dev/null || true
+      else
+        ip route replace "${REMOTE_VIP}/32" dev "$TUN_NAME" scope link src "${VIP_CIDR%/*}" 2>/dev/null || true
+      fi
     fi
   fi
 }
 trap rollback ERR
 
 # IP 变更，重建
-ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$REMOTE_IP" "$VIP_CIDR" "$REMOTE_VIP"
+if ! ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$REMOTE_IP" "$VIP_CIDR" "$REMOTE_VIP"; then
+  echo "$(date) $TUN_NAME: 配置失败" >&2
+  exit 1
+fi
 
+# 重启相关的 WireGuard 接口
 for conf in /etc/wireguard/*.conf; do
   [[ -f "$conf" ]] || continue
   IFACE="$(basename "$conf" .conf)"
@@ -392,8 +455,15 @@ for conf in /etc/wireguard/*.conf; do
   wg-quick up "$IFACE" >/dev/null 2>&1 || true
 done
 
-echo "$REMOTE_IP" >"$STATE_FILE"
-echo "$REMOTE_IP" >"$PERSIST_FILE" 2>/dev/null || true
+# 保存状态
+if ! echo "$REMOTE_IP" >"$STATE_FILE" 2>/dev/null; then
+  echo "$(date) $TUN_NAME: 警告 - 无法保存运行时状态文件" >&2
+fi
+if ! echo "$REMOTE_IP" >"$PERSIST_FILE" 2>/dev/null; then
+  echo "$(date) $TUN_NAME: 警告 - 无法保存持久化状态文件" >&2
+fi
+
+echo "$(date) $TUN_NAME: 配置成功，远端 IP: $REMOTE_IP" >&2
 exit 0
 KEEPER_EOF
     chmod 755 "$keeper_script_path"
