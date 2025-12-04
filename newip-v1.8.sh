@@ -21,7 +21,7 @@ Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
 
 # --- 版本与路径 ---
-shell_version="1.7.0"
+shell_version="1.8.0"
 ct_new_ver="2.11.2"
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -271,6 +271,19 @@ source "$CONF_FILE"
 : "${VIP_CIDR:?}"
 : "${REMOTE_VIP:?}"
 
+# 更新 env 中的 RESOLVED_IP 字段
+update_env_resolved_ip() {
+  local env_file="$CONF_FILE" tmp
+  tmp="$(mktemp "${env_file}.XXXXXX")" || return 0
+  if grep -q '^RESOLVED_IP=' "$env_file" 2>/dev/null; then
+    sed 's/^RESOLVED_IP=.*/RESOLVED_IP='"$REMOTE_IP"'/' "$env_file" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  else
+    cat "$env_file" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    printf '\nRESOLVED_IP=%s\n' "$REMOTE_IP" >>"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  fi
+  mv -f "$tmp" "$env_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
 resolve_ip() {
   if [[ "$MODE" == "v6" ]]; then
     getent hosts "$DDNS_NAME" | awk '{print $1}' | grep -E '^[0-9a-fA-F:]+$' | head -n1 || \
@@ -302,36 +315,10 @@ resolve_ip_try() {
   echo ""
 }
 
-# 确保对应内核模块已加载（开机后第一次运行时尤为重要）
-ensure_ipip_module() {
-  local mode="$1"
-  if [[ "$mode" == "v6" ]]; then
-    if ! lsmod | grep -q '^ip6_tunnel'; then
-      if ! modprobe ip6_tunnel 2>/dev/null; then
-        echo "$(date) $TUN_NAME: 无法加载 ip6_tunnel 模块" >&2
-        return 1
-      fi
-    fi
-  else
-    if ! lsmod | grep -q '^ipip'; then
-      if ! modprobe ipip 2>/dev/null; then
-        echo "$(date) $TUN_NAME: 无法加载 ipip 模块" >&2
-        return 1
-      fi
-    fi
-  fi
-  return 0
-}
-
 # 幂等重建接口/地址/路由
 ensure_ipip_stack() {
   local name="$1" mode="$2" local_ip="$3" remote_ip="$4" vip_cidr="$5" remote_vip="$6"
-
-  # 确保内核模块可用
-  if ! ensure_ipip_module "$mode"; then
-    return 1
-  fi
-
+  
   # 关闭接口
   ip link set "$name" down 2>/dev/null || true
   
@@ -398,23 +385,22 @@ else
   REMOTE_IP="$(resolve_ip_try "$DDNS_NAME" "$MODE")"
 fi
 
-# 从这里开始，所有会动隧道/状态的操作都加锁，避免并发定时器导致配置争用
-with_lock || exit 0
-
 if [[ -z "$REMOTE_IP" ]]; then
   PREV_REMOTE_LOCAL="$(cat "$STATE_FILE" 2>/dev/null || true)"
   [[ -z "$PREV_REMOTE_LOCAL" ]] && PREV_REMOTE_LOCAL="$(cat "$PERSIST_FILE" 2>/dev/null || true)"
   if [[ -n "$PREV_REMOTE_LOCAL" ]]; then
     echo "$(date) $TUN_NAME: DNS 解析失败，使用历史远端 $PREV_REMOTE_LOCAL 进行恢复" >&2
+    with_lock || exit 0
     ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$PREV_REMOTE_LOCAL" "$VIP_CIDR" "$REMOTE_VIP"
     echo "$PREV_REMOTE_LOCAL" >"$STATE_FILE" 2>/dev/null || true
-    echo "$PREV_REMOTE_LOCAL" >"$PERSIST_FILE" 2>/dev/null || true
     exit 0
   else
     echo "$(date) $TUN_NAME: resolve failed and no previous IP" >&2
     exit 0
   fi
 fi
+
+with_lock || exit 0
 
 PREV_REMOTE="$(cat "$STATE_FILE" 2>/dev/null || true)"
 if [[ "$REMOTE_IP" == "$PREV_REMOTE" ]]; then
@@ -473,6 +459,26 @@ if ! ensure_ipip_stack "$TUN_NAME" "$MODE" "$LOCAL_IP" "$REMOTE_IP" "$VIP_CIDR" 
   echo "$(date) $TUN_NAME: 配置失败" >&2
   exit 1
 fi
+
+# 新 IP 健康检查：如果新 IP 不通，则回滚到旧 IP
+if [[ -n "$PREV_REMOTE" && -n "$REMOTE_VIP" ]]; then
+  if [[ "$MODE" == "v6" ]]; then
+    if ! ping6 -c1 -w2 "$REMOTE_VIP" >/dev/null 2>&1; then
+      echo "$(date) $TUN_NAME: 新远端 IP $REMOTE_IP 不可达，回滚到 $PREV_REMOTE" >&2
+      rollback
+      exit 1
+    fi
+  else
+    if ! ping -4 -c1 -w2 "$REMOTE_VIP" >/dev/null 2>&1; then
+      echo "$(date) $TUN_NAME: 新远端 IP $REMOTE_IP 不可达，回滚到 $PREV_REMOTE" >&2
+      rollback
+      exit 1
+    fi
+  fi
+fi
+
+# 记录解析到的当前远端 IP
+update_env_resolved_ip
 
 # 重启相关的 WireGuard 接口
 for conf in /etc/wireguard/*.conf; do
