@@ -3,7 +3,6 @@
 # 功能：
 #  - 固定端口、固定账号密码（在脚本顶部配置）
 #  - 支持多用户
-#  - 只允许指定 IP 访问（白名单）
 #  - 安装 / 卸载 二合一：./sk5.sh install|uninstall
 
 set -e
@@ -12,14 +11,14 @@ set -e
 #  可配置参数区域    #
 #====================#
 
-# 监听端口
+# 监听端口（已修改为 2080）
 SOCKS_PORT=2080
 
 # 多用户账号密码列表：格式为 "user:pass"，空格分隔多个
 # 示例：USERS=("user1:pass1" "user2:pass2")
 USERS=(
-  "user1:pass1"
-  "user2:pass2"
+  "alanxie:153263444"
+  
 )
 
 # 允许访问的 IP 白名单（只允许这些 IP 作为客户端连接）
@@ -84,10 +83,21 @@ write_config() {
     local CONF_PATH="/etc/danted.conf"
     green "生成 Dante 配置文件: $CONF_PATH"
 
+    # 自动获取服务器主网卡名称（修复 external 0.0.0.0 报错）
+    local INTERFACE
+    INTERFACE=$(ip -4 route show default | awk '/default/ {print $5}' | head -n1)
+
+    if [ -z "$INTERFACE" ]; then
+        red "无法自动检测到外网网卡名称，请手动修改脚本中的 external 参数。"
+        exit 1
+    fi
+
+    green "检测到出口网卡接口: $INTERFACE"
+
     {
         echo "logoutput: syslog"
         echo "internal: 0.0.0.0 port = $SOCKS_PORT"
-        echo "external: 0.0.0.0"
+        echo "external: $INTERFACE"
         echo
         # 认证方式：用户名密码
         echo "method: username"
