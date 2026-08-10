@@ -13,7 +13,7 @@ set -e
 #====================#
 
 # 监听端口
-SOCKS_PORT=1080
+SOCKS_PORT=2080
 
 # 多用户账号密码列表：格式为 "user:pass"，空格分隔多个
 # 示例：USERS=("user1:pass1" "user2:pass2")
