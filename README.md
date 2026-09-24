@@ -1,4 +1,4 @@
-bash <(curl -L -s https://github.soloplus.xyz/https://github.com/alanxie1999/me/blob/main/newip.sh) 
+bash <(curl -L -s https://github.soloplus.xyz/https://github.com/alanxie1999/me/blob/main/tunnel-manager.sh) 
 
 bash <(curl -L -s https://github.soloplus.xyz/bash <(curl -sSL https://raw.githubusercontent.com/alanxie1999/me/main/sk5.sh))
 
